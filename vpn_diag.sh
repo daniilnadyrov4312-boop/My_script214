@@ -35,7 +35,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 if [ "$IPERF_SERVER" -eq 1 ]; then
-    command -v iperf3 >/dev/null || apt-get update -qq && apt-get install -y iperf3
+    command -v iperf3 >/dev/null || { apt-get update -qq && apt-get install -y iperf3; }
     echo "Стартую iperf3 на 0.0.0.0:5201 ..."
     echo "Не забудь открыть порт: ufw allow 5201/tcp && ufw allow 5201/udp"
     exec iperf3 -s -p 5201
@@ -78,17 +78,28 @@ section "2. NETWORK INTERFACES"
 run "Интерфейсы"   ip -br addr
 run "Маршруты"     ip route
 run "Default iface (по умолчанию)"   bash -c "ip route get 1.1.1.1 | head -1"
-DEFIF="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i==\"dev\")print $(i+1)}')"
+# фикс: ip -o выдаёт всё в одну строку, sed достаёт значение после 'dev'
+DEFIF="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)"
 echo "DEFIF=${DEFIF}" | tee -a "$OUT"
 
 if [ -n "${DEFIF:-}" ]; then
     run "ip -s link на ${DEFIF}" ip -s link show "$DEFIF"
     if command -v ethtool >/dev/null; then
-        run "ethtool ${DEFIF}"        ethtool "$DEFIF"
-        run "ethtool -S (drops/errors)" ethtool -S "$DEFIF"
-        run "ethtool -g (ring buffers)"  ethtool -g "$DEFIF"
-        run "ethtool -k (offload)"       ethtool -k "$DEFIF"
+        run "ethtool ${DEFIF}"            ethtool "$DEFIF"
+        run "ethtool -S errors/drops"     bash -c "ethtool -S ${DEFIF} 2>&1 | egrep -i 'err|drop|discard|fail|miss|overrun|underrun|fcs|crc' || echo '(нет счётчиков ошибок или их 0)'"
+        run "ethtool -S полный"           ethtool -S "$DEFIF"
+        run "ethtool -g (ring buffers)"   ethtool -g "$DEFIF"
+        run "ethtool -k offload (хвост)"  bash -c "ethtool -k ${DEFIF} 2>/dev/null | egrep -i 'tcp-segmentation|generic-segmentation|generic-receive|large-receive|tx-checksum|rx-checksum|scatter-gather'"
     fi
+    # Текущий bandwidth: считаем дельту байт за 5 секунд
+    runsh "Текущий bandwidth на ${DEFIF} (за 5 сек)" "
+        rx1=\$(cat /sys/class/net/${DEFIF}/statistics/rx_bytes);
+        tx1=\$(cat /sys/class/net/${DEFIF}/statistics/tx_bytes);
+        sleep 5;
+        rx2=\$(cat /sys/class/net/${DEFIF}/statistics/rx_bytes);
+        tx2=\$(cat /sys/class/net/${DEFIF}/statistics/tx_bytes);
+        echo \"RX: \$(( (rx2-rx1)*8/5/1000000 )) Mbit/s\";
+        echo \"TX: \$(( (tx2-tx1)*8/5/1000000 )) Mbit/s\""
 fi
 
 # ---------- TCP / sysctl ----------
@@ -100,6 +111,16 @@ run "ip_forward"   bash -c "sysctl net.ipv4.ip_forward"
 run "qdisc на интерфейсах" tc -s qdisc show
 run "ss -s (общая статистика)" ss -s
 runsh "Retrans / drops (nstat)"  "nstat -az 2>/dev/null | egrep -i 'retrans|drop|loss|reorder|listenoverflow|listendrops|tcpsynretrans' || true"
+runsh "Retrans-rate за 30 сек (актуальный)" "
+    nstat -rs >/dev/null 2>&1;
+    sleep 30;
+    out=\$(nstat -an 2>/dev/null);
+    sent=\$(echo \"\$out\"  | awk '/^TcpOutSegs / {print \$2}');
+    retr=\$(echo \"\$out\"  | awk '/^TcpRetransSegs / {print \$2}');
+    echo \"Sent: \$sent  Retrans: \$retr\";
+    if [ -n \"\$sent\" ] && [ \"\$sent\" -gt 0 ]; then
+        echo \"Retrans rate: \$(awk -v r=\$retr -v s=\$sent 'BEGIN{printf \"%.3f%%\\n\", r*100/s}')\";
+    fi"
 runsh "TCP сегменты (netstat)"   "netstat -s 2>/dev/null | egrep -i 'segments retrans|packets received|bad segments|listen' || true"
 
 # ---------- conntrack ----------
@@ -132,8 +153,10 @@ section "7. CLOUDFLARE WARP"
 runsh "warp-cli status"   "warp-cli status 2>/dev/null || echo 'warp-cli не установлен/не запущен'"
 runsh "warp-cli settings" "warp-cli settings 2>/dev/null || true"
 runsh "WARP listen?"      "ss -tlnp 2>/dev/null | grep ':40000' || echo 'порт 40000 не слушается'"
-runsh "Тест WARP-прокси (curl через 127.0.0.1:40000)" \
+runsh "Тест WARP-прокси (curl через 127.0.0.1:40000) — trace" \
     "curl -m 8 -x socks5h://127.0.0.1:40000 -s https://www.cloudflare.com/cdn-cgi/trace 2>&1 | head -20"
+runsh "Скорость через WARP (cachefly 100MB через socks5)" \
+    "curl -o /dev/null -x socks5h://127.0.0.1:40000 -m 40 -w 'speed=%{speed_download} bytes/s   size=%{size_download}   time=%{time_total}\n' https://cachefly.cachefly.net/100mb.test 2>&1"
 
 # ---------- DNS ----------
 section "8. DNS"
@@ -164,6 +187,7 @@ if [ -n "$PEER" ]; then
     if command -v iperf3 >/dev/null; then
         runsh "iperf3 TCP к peer (30s)"  "iperf3 -c ${PEER} -p 5201 -t 30 -i 5"
         runsh "iperf3 TCP reverse (30s)" "iperf3 -c ${PEER} -p 5201 -t 30 -i 5 -R"
+        runsh "iperf3 TCP параллель 4 потока (20s)" "iperf3 -c ${PEER} -p 5201 -t 20 -P 4"
         runsh "iperf3 UDP 200M (10s)"    "iperf3 -c ${PEER} -p 5201 -u -b 200M -t 10"
     else
         echo "iperf3 не установлен — apt install iperf3" | tee -a "$OUT"
@@ -171,12 +195,16 @@ if [ -n "$PEER" ]; then
 fi
 
 # ---------- speed (наружу) ----------
-section "11. PUBLIC SPEED TEST (curl)"
-# тянем большой файл через дефолтный маршрут — это «голая» скорость хоста, без xray
-runsh "curl 100MB cachefly"  "curl -o /dev/null -m 30 -w 'speed=%{speed_download} bytes/s   size=%{size_download}   total_time=%{time_total}\n' https://cachefly.cachefly.net/100mb.test"
-runsh "curl 100MB hetzner"   "curl -o /dev/null -m 30 -w 'speed=%{speed_download} bytes/s   size=%{size_download}   total_time=%{time_total}\n' https://speed.hetzner.de/100MB.bin"
-runsh "curl через WARP-прокси (если есть)" \
-    "curl -o /dev/null -x socks5h://127.0.0.1:40000 -m 30 -w 'speed=%{speed_download} bytes/s   total_time=%{time_total}\n' https://speed.cloudflare.com/__down?bytes=104857600 2>&1"
+section "11. PUBLIC SPEED TEST (curl, голая скорость БЕЗ xray и WARP)"
+# тянем большие файлы через дефолтный маршрут — это «голая» скорость хоста
+runsh "curl 100MB cachefly (US/Anycast)" \
+    "curl -o /dev/null -m 40 -w 'speed=%{speed_download} bytes/s   size=%{size_download}   time=%{time_total}\n' https://cachefly.cachefly.net/100mb.test"
+runsh "curl 100MB OVH eu" \
+    "curl -o /dev/null -m 40 -w 'speed=%{speed_download} bytes/s   size=%{size_download}   time=%{time_total}\n' https://proof.ovh.net/files/100Mb.dat"
+runsh "curl 100MB leaseweb DE" \
+    "curl -o /dev/null -m 40 -w 'speed=%{speed_download} bytes/s   size=%{size_download}   time=%{time_total}\n' https://mirror.leaseweb.com/speedtest/100mb.bin"
+runsh "curl 100MB Cloudflare speed (raw, без WARP)" \
+    "curl -o /dev/null -m 40 -w 'speed=%{speed_download} bytes/s   size=%{size_download}   time=%{time_total}\n' 'https://speed.cloudflare.com/__down?bytes=104857600'"
 
 # ---------- dmesg / errors ----------
 section "12. DMESG (последние ошибки за 24ч)"
@@ -188,12 +216,13 @@ section "13. БЫСТРЫЕ ПОДСКАЗКИ"
 {
 echo "Что смотреть в первую очередь:"
 echo "  • CPU xray в секции 6 — если pcpu >= 90 на ядро = упёрлось в шифрование (single-thread)."
-echo "  • retrans/drops в секции 3 — если retrans-rate растёт > 1% = плохой аплинк."
+echo "  • retrans-rate в секции 3 (за 30 сек) — норма < 0.5%, > 1% = плохой аплинк."
 echo "  • ethtool -S errors/dropped в секции 2 — железо/драйвер/MTU."
 echo "  • mtr loss% в секциях 9-10 — где теряется трафик: первый хоп (хостер), на пути или на peer."
 echo "  • WARP в секции 7 — если каскад завязан на WARP, и он лагает = вся цепочка лагает."
 echo "  • iperf3 в секции 10 — это РЕАЛЬНАЯ скорость линка между RU и CH без шифрования."
 echo "    Если iperf3 даёт 1Gbps, а пользователь видит 20Mbps — упёрлось НЕ в линк, а в xray/CPU/WARP."
+echo "  • Секция 11: голая скорость хостера. Если она и так слабая — проблема у хостера, не у тебя."
 echo
 echo "Сравни /tmp/vpn-diag-*.txt с RU и CH сервера: diff -y или просто рядом в редакторе."
 } | tee -a "$OUT"
