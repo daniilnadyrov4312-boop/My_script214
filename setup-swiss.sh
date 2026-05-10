@@ -36,8 +36,16 @@ echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyr
 apt-get update -y
 apt-get install -y cloudflare-warp
 
+# Демон warp-svc может ещё не успеть стартануть после postinst
+systemctl enable warp-svc 2>/dev/null || true
+systemctl start warp-svc 2>/dev/null || true
+sleep 3
+
 log "Регистрация и запуск WARP в proxy-режиме на $WARP_PROXY_PORT..."
-warp-cli registration new || true
+# warp-cli 2024+ : registration new ; старее : register ; пробуем оба, игнорим если уже зарегано
+warp-cli registration new 2>/dev/null \
+  || warp-cli register 2>/dev/null \
+  || true
 warp-cli mode proxy
 warp-cli proxy port "$WARP_PROXY_PORT"
 warp-cli connect

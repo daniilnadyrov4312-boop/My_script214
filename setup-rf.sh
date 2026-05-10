@@ -55,7 +55,7 @@ chmod 644 "/var/www/subscribe$SUBSCRIBE_PATH"
 cat >/etc/nginx/sites-available/subscribe <<EOF
 server {
     listen 80 default_server;
-    listen [::]:80 default_server;
+    # IPv6-listen опционально: на серверах с отключённым v6 nginx упадёт при ipv6only=on
     server_name $SUBSCRIBE_DOMAIN;
 
     root /var/www/subscribe;
@@ -80,38 +80,19 @@ EOF
 
 ln -sf /etc/nginx/sites-available/subscribe /etc/nginx/sites-enabled/subscribe
 rm -f /etc/nginx/sites-enabled/default
-nginx -t && systemctl reload nginx
+nginx -t || die "nginx config invalid"
+systemctl enable nginx >/dev/null 2>&1 || true
+systemctl restart nginx
 ok "nginx раздаёт http://$SUBSCRIBE_DOMAIN$SUBSCRIBE_PATH (origin порт 80)"
-
-# --- IPTABLES DNAT КАСКАД ДЛЯ MTPROTO ---
-log "Настройка каскада MTProto: tcp/${RF_MTPROTO_PORT} → ${SWISS_IP}:${SWISS_TELEMT_PORT}..."
-IFACE=$(detect_egress_iface)
-[ -z "$IFACE" ] && die "Не определён egress-интерфейс."
-
-# Чистим старые правила
-iptables -t nat -D PREROUTING -p tcp --dport "$RF_MTPROTO_PORT" -j DNAT --to-destination "$SWISS_IP:$SWISS_TELEMT_PORT" 2>/dev/null || true
-iptables -D FORWARD -p tcp -d "$SWISS_IP" --dport "$SWISS_TELEMT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -p tcp -s "$SWISS_IP" --sport "$SWISS_TELEMT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-
-# Накатываем
-iptables -t nat -A PREROUTING -p tcp --dport "$RF_MTPROTO_PORT" -j DNAT --to-destination "$SWISS_IP:$SWISS_TELEMT_PORT"
-iptables -A FORWARD -p tcp -d "$SWISS_IP" --dport "$SWISS_TELEMT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
-iptables -A FORWARD -p tcp -s "$SWISS_IP" --sport "$SWISS_TELEMT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT
-if ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
-    iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
-fi
-
-# UFW forward policy
-sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-
-netfilter-persistent save >/dev/null
-ok "Каскад настроен: клиенты → ${RF_MTPROTO_PORT} → Swiss:${SWISS_TELEMT_PORT}"
 
 # --- SSH + FAIL2BAN ---
 NEW_SSH_PORT=$(randomize_ssh_port)
 setup_fail2ban_ssh "$NEW_SSH_PORT"
 
-# --- UFW ---
+# --- UFW (СНАЧАЛА, чтобы reset не смыл наши iptables FORWARD) ---
+# Ставим FORWARD policy ACCEPT в ufw-конфиге ДО enable.
+sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+
 ufw_reset_base
 ufw_allow "$NEW_SSH_PORT" tcp
 [ -n "$XUI_PORT" ] && ufw_allow "$XUI_PORT" tcp
@@ -120,6 +101,27 @@ ufw_allow 8443 tcp          # 3x-ui inbounds
 ufw_allow 80 tcp            # nginx (sub-файл) для Cloudflare
 ufw_allow "$RF_MTPROTO_PORT" tcp   # каскад MTProto
 ufw_enable
+
+# --- IPTABLES DNAT КАСКАД ДЛЯ MTPROTO (ПОСЛЕ ufw, иначе reset смыл бы FORWARD) ---
+log "Настройка каскада MTProto: tcp/${RF_MTPROTO_PORT} → ${SWISS_IP}:${SWISS_TELEMT_PORT}..."
+IFACE=$(detect_egress_iface)
+[ -z "$IFACE" ] && die "Не определён egress-интерфейс."
+
+# Идемпотентно чистим старые правила (если запуск повторный)
+iptables -t nat -D PREROUTING -p tcp --dport "$RF_MTPROTO_PORT" -j DNAT --to-destination "$SWISS_IP:$SWISS_TELEMT_PORT" 2>/dev/null || true
+iptables -D FORWARD -p tcp -d "$SWISS_IP" --dport "$SWISS_TELEMT_PORT" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -p tcp -s "$SWISS_IP" --sport "$SWISS_TELEMT_PORT" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+
+# Накатываем (conntrack вместо state — современный nftables backend)
+iptables -t nat -A PREROUTING -p tcp --dport "$RF_MTPROTO_PORT" -j DNAT --to-destination "$SWISS_IP:$SWISS_TELEMT_PORT"
+iptables -I FORWARD 1 -p tcp -d "$SWISS_IP" --dport "$SWISS_TELEMT_PORT" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+iptables -I FORWARD 1 -p tcp -s "$SWISS_IP" --sport "$SWISS_TELEMT_PORT" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+if ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
+    iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+fi
+
+netfilter-persistent save >/dev/null
+ok "Каскад настроен: клиенты → ${RF_MTPROTO_PORT} → Swiss:${SWISS_TELEMT_PORT}"
 
 # --- СОХРАНИТЬ КОНФИГ ---
 PUB_IP=$(detect_public_ip)
