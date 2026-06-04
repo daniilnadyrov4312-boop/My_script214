@@ -188,16 +188,25 @@ ufw_enable() {
 }
 
 # --- ИЗВЛЕЧЕНИЕ КРЕДОВ 3X-UI ИЗ БД ---
+# 3X-UI v3.x:
+#   - username/password лежат в таблице users (plaintext до ~v3.x, hash потом — но пока plaintext)
+#   - порт в settings.webPort, путь в settings.webBasePath (может быть обёрнут в "/.../" или "/path/")
+# echo'ит "USER PASS PORT WEBPATH" через пробел; пустые значения = "?"
 extract_3xui_creds() {
-    # echo'ит "USER PASS PORT WEBPATH" через пробел
     local db="/etc/x-ui/x-ui.db"
-    [ -f "$db" ] || { echo "" ""  "" ""; return; }
+    if [ ! -f "$db" ]; then
+        echo "? ? ? ?"
+        return
+    fi
     local u p port path
-    u=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='username';" 2>/dev/null)
-    p=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='password';" 2>/dev/null)
-    port=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='port';" 2>/dev/null)
+    u=$(sqlite3 "$db" "SELECT username FROM users LIMIT 1;" 2>/dev/null)
+    p=$(sqlite3 "$db" "SELECT password FROM users LIMIT 1;" 2>/dev/null)
+    port=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='webPort';" 2>/dev/null)
     path=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='webBasePath';" 2>/dev/null)
-    echo "$u $p $port $path"
+    # Убираем обрамляющие кавычки и слэши у webBasePath
+    path="${path%\"}"; path="${path#\"}"
+    path="${path#/}"; path="${path%/}"
+    echo "${u:-?} ${p:-?} ${port:-?} ${path:-?}"
 }
 
 # --- УСТАНОВКА 3X-UI ---
