@@ -70,6 +70,36 @@ EOF
     ok "ip_forward включён."
 }
 
+# --- СЕТЕВОЙ ТЮНИНГ ДЛЯ VPN/ПРОКСИ ---
+# Лечит:
+#   - UDP-дропы при всплесках (UdpRcvbufErrors) → "100% loss в моменте" в играх
+#   - забивание conntrack-таблицы при NAT-каскаде
+#   - переполнения очередей на сетевом интерфейсе
+# Применяется мгновенно через sysctl --system, без перезапуска сервисов.
+tune_network_sysctl() {
+    log "Применение сетевого тюнинга (UDP-буферы + conntrack)..."
+    cat >/etc/sysctl.d/99-vpn-tuning.conf <<'EOF'
+# VPN/proxy network tuning
+# Откат: rm этот файл + sysctl --system
+
+# --- сетевые буферы (против UDP-дропов и TCP retransmits) ---
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.core.netdev_max_backlog = 5000
+
+# --- UDP-память глобально (xray открывает сотни UDP-сокетов) ---
+net.ipv4.udp_mem = 65536 131072 262144
+
+# --- conntrack (для NAT/forward, актуально на RF) ---
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+EOF
+    sysctl --system >/dev/null 2>&1 || true
+    ok "Сетевой тюнинг применён (rmem/wmem 16MB, conntrack 262k)."
+}
+
 # --- АВТООБНОВЛЕНИЯ БЕЗОПАСНОСТИ ---
 enable_unattended_upgrades() {
     log "Настройка unattended-upgrades..."
@@ -78,6 +108,20 @@ APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
     ok "Автообновления безопасности включены."
+}
+
+# --- МОНИТОРИНГ ТРАФИКА И СИСТЕМЫ ---
+# vnstat: графики bandwidth по часам/дням
+# sysstat (sar): системные метрики каждую минуту (CPU/RAM/network errors)
+# Через 24ч появятся полноценные данные для анализа аномалий.
+install_monitoring() {
+    log "Установка мониторинга (vnstat + sysstat)..."
+    apt-get install -y vnstat sysstat >/dev/null
+    sed -i 's/^ENABLED=.*/ENABLED="true"/' /etc/default/sysstat
+    # default cron — раз в 10 мин; меняем на каждую минуту для большей детализации
+    sed -i 's|^5-55/10|*/1|' /etc/cron.d/sysstat 2>/dev/null || true
+    systemctl enable --now vnstat sysstat >/dev/null 2>&1 || true
+    ok "vnstat + sysstat подняты (через 24ч будут полные графики)."
 }
 
 # --- СЛУЧАЙНЫЙ SSH-ПОРТ ---
@@ -207,6 +251,39 @@ EXP
         die "3X-UI install не отработал — смотри $logf"
     fi
     ok "3X-UI установлен."
+}
+
+# --- ПРОВЕРКА IP В РЕЕСТРАХ БЛОКИРОВОК РКН ---
+# Не 100% (TSPU блочит вне реестра), но если IP уже в zapret-info / antifilter —
+# это поздно для VPN. Тогда лучше сразу просить смену IP у хостера.
+check_ip_blacklist() {
+    local ip="$1"
+    [ -z "$ip" ] && return 0
+    log "Проверка IP $ip в реестрах блокировок РКН..."
+    local found=0
+
+    # zapret-info (зеркало основного реестра)
+    if curl -s --max-time 15 "https://raw.githubusercontent.com/zapret-info/z-i/master/dump.csv" \
+        | grep -qE "(^|;|,|\")${ip//./\\.}([,;\"]|$)" 2>/dev/null
+    then
+        warn "  ⚠ IP найден в zapret-info реестре"
+        found=1
+    fi
+
+    # antifilter.network (полный список)
+    if curl -s --max-time 15 "https://api.antifilter.network/list/ip.lst" \
+        | grep -qE "^${ip//./\\.}$" 2>/dev/null
+    then
+        warn "  ⚠ IP найден в antifilter.network"
+        found=1
+    fi
+
+    if [ "$found" -eq 0 ]; then
+        ok "IP $ip НЕ в реестрах. TSPU может всё равно блочить отдельно — мониторь по факту."
+    else
+        warn "IP $ip уже в чёрных списках — VPN-клиенты из РФ не смогут подключиться."
+        warn "Запроси у хостера СМЕНУ IP ПЕРЕД использованием."
+    fi
 }
 
 # --- БАЗОВЫЙ HARDENING (вызывать первым в setup-*.sh) ---

@@ -1,14 +1,18 @@
 #!/bin/bash
 # setup-rf.sh — установка российского (домашнего) сервера.
-# Ставит: базу + 3X-UI (без WARP) + nginx для раздачи файла подписки + iptables DNAT
-#         для каскада MTProto на швейцарский сервер.
+# Архитектура (актуальная):
+#   - 3X-UI с VLESS+Reality inbound'ами (основной VPN-трафик ВЫХОДИТ С САМОГО RF)
+#   - nginx раздаёт файл подписки (HTTP origin, наружу HTTPS делает Cloudflare proxy)
+#   - сетевой тюнинг (UDP-буферы + conntrack) — лечит игровые лаги и забивание NAT
+#   - мониторинг (vnstat + sysstat) — для последующей диагностики
+#   - hardening: SSH-порт случайный, fail2ban, UFW, BBR, автообновления
 #
 # ENV-переменные:
-#   SWISS_IP            — IP швейцарского сервера (обязательно)
-#   SWISS_TELEMT_PORT   — порт telemt на швейцарском (default: 443)
-#   RF_MTPROTO_PORT     — порт, на котором клиенты подключаются к РФ (default: 444)
-#   SUBSCRIBE_DOMAIN    — домен для раздачи sub-файла, без https:// (например sub.example.com)
+#   SUBSCRIBE_DOMAIN    — домен для раздачи sub-файла, без https:// (обязательно)
 #   SUBSCRIBE_PATH      — URL-путь файла подписки (default: /sub.txt)
+#
+# Запуск:
+#   SUBSCRIBE_DOMAIN=sub.example.com ./setup-rf.sh
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,27 +22,25 @@ mkdir -p /etc/myscript
 CONFIG_FILE=/etc/myscript/rf.env
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
-SWISS_IP="${SWISS_IP:-}"
-SWISS_TELEMT_PORT="${SWISS_TELEMT_PORT:-443}"
-RF_MTPROTO_PORT="${RF_MTPROTO_PORT:-444}"
 SUBSCRIBE_DOMAIN="${SUBSCRIBE_DOMAIN:-}"
 SUBSCRIBE_PATH="${SUBSCRIBE_PATH:-/sub.txt}"
 
-[ -z "$SWISS_IP" ] && die "Не задан SWISS_IP. Запусти: SWISS_IP=1.2.3.4 ./setup-rf.sh"
-[ -z "$SUBSCRIBE_DOMAIN" ] && die "Не задан SUBSCRIBE_DOMAIN. Запусти с SUBSCRIBE_DOMAIN=sub.example.com ..."
+[ -z "$SUBSCRIBE_DOMAIN" ] && die "Не задан SUBSCRIBE_DOMAIN. Запусти: SUBSCRIBE_DOMAIN=sub.example.com ./setup-rf.sh"
 
 if [ -f /usr/local/x-ui/x-ui ]; then
     die "3X-UI уже установлен — скрипт только для чистой установки."
 fi
 
+# === БАЗА ===
 do_base_hardening
 enable_ip_forward
+tune_network_sysctl
 
-# --- 3X-UI (БЕЗ WARP) ---
+# === 3X-UI ===
 install_3xui
 read -r XUI_USER XUI_PASS XUI_PORT XUI_PATH <<<"$(extract_3xui_creds)"
 
-# --- NGINX + ФАЙЛ ПОДПИСКИ ---
+# === NGINX + ФАЙЛ ПОДПИСКИ ===
 log "Установка nginx и раздачи файла подписки на $SUBSCRIBE_DOMAIN$SUBSCRIBE_PATH..."
 apt-get install -y nginx
 
@@ -54,17 +56,10 @@ chmod 644 "/var/www/subscribe$SUBSCRIBE_PATH"
 
 cat >/etc/nginx/sites-available/subscribe <<EOF
 server {
-    listen 80 default_server;
-    # IPv6-listen опционально: на серверах с отключённым v6 nginx упадёт при ipv6only=on
+    listen 80;
     server_name $SUBSCRIBE_DOMAIN;
 
     root /var/www/subscribe;
-    index index.html;
-
-    # Cloudflare-only access: блокируем прямые подключения к origin
-    # (раскомментируй если хочешь жёстко закрыть, понадобятся real-IP CF ranges)
-    # set_real_ip_from 173.245.48.0/20;  # ... остальные CF ranges
-    # real_ip_header CF-Connecting-IP;
 
     location $SUBSCRIBE_PATH {
         default_type text/plain;
@@ -85,56 +80,38 @@ systemctl enable nginx >/dev/null 2>&1 || true
 systemctl restart nginx
 ok "nginx раздаёт http://$SUBSCRIBE_DOMAIN$SUBSCRIBE_PATH (origin порт 80)"
 
-# --- SSH + FAIL2BAN ---
+# === SSH + FAIL2BAN ===
 NEW_SSH_PORT=$(randomize_ssh_port)
 setup_fail2ban_ssh "$NEW_SSH_PORT"
 
-# --- UFW (СНАЧАЛА, чтобы reset не смыл наши iptables FORWARD) ---
-# Ставим FORWARD policy ACCEPT в ufw-конфиге ДО enable.
+# === UFW ===
+# FORWARD policy ACCEPT — на случай если потом будешь ставить kaskad-pro для MTProxy.
 sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
 
 ufw_reset_base
 ufw_allow "$NEW_SSH_PORT" tcp
-[ -n "$XUI_PORT" ] && ufw_allow "$XUI_PORT" tcp
-ufw_allow 443 tcp           # 3x-ui inbounds
-ufw_allow 8443 tcp          # 3x-ui inbounds
+[ -n "$XUI_PORT" ] && ufw_allow "$XUI_PORT" tcp   # 3X-UI panel
+ufw_allow 443 tcp           # 3X-UI VLESS inbound (Reality/xhttp)
+ufw_allow 8443 tcp          # 3X-UI второй inbound (опционально)
 ufw_allow 80 tcp            # nginx (sub-файл) для Cloudflare
-ufw_allow "$RF_MTPROTO_PORT" tcp   # каскад MTProto
+ufw_allow 2096 tcp          # 3X-UI subscription server (внутренний)
 ufw_enable
 
-# --- IPTABLES DNAT КАСКАД ДЛЯ MTPROTO (ПОСЛЕ ufw, иначе reset смыл бы FORWARD) ---
-log "Настройка каскада MTProto: tcp/${RF_MTPROTO_PORT} → ${SWISS_IP}:${SWISS_TELEMT_PORT}..."
-IFACE=$(detect_egress_iface)
-[ -z "$IFACE" ] && die "Не определён egress-интерфейс."
+# === МОНИТОРИНГ ===
+install_monitoring
 
-# Идемпотентно чистим старые правила (если запуск повторный)
-iptables -t nat -D PREROUTING -p tcp --dport "$RF_MTPROTO_PORT" -j DNAT --to-destination "$SWISS_IP:$SWISS_TELEMT_PORT" 2>/dev/null || true
-iptables -D FORWARD -p tcp -d "$SWISS_IP" --dport "$SWISS_TELEMT_PORT" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -p tcp -s "$SWISS_IP" --sport "$SWISS_TELEMT_PORT" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-
-# Накатываем (conntrack вместо state — современный nftables backend)
-iptables -t nat -A PREROUTING -p tcp --dport "$RF_MTPROTO_PORT" -j DNAT --to-destination "$SWISS_IP:$SWISS_TELEMT_PORT"
-iptables -I FORWARD 1 -p tcp -d "$SWISS_IP" --dport "$SWISS_TELEMT_PORT" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
-iptables -I FORWARD 1 -p tcp -s "$SWISS_IP" --sport "$SWISS_TELEMT_PORT" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-if ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
-    iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
-fi
-
-netfilter-persistent save >/dev/null
-ok "Каскад настроен: клиенты → ${RF_MTPROTO_PORT} → Swiss:${SWISS_TELEMT_PORT}"
-
-# --- СОХРАНИТЬ КОНФИГ ---
+# === СОХРАНИТЬ КОНФИГ ===
 PUB_IP=$(detect_public_ip)
 cat >"$CONFIG_FILE" <<EOF
-SWISS_IP="$SWISS_IP"
-SWISS_TELEMT_PORT="$SWISS_TELEMT_PORT"
-RF_MTPROTO_PORT="$RF_MTPROTO_PORT"
 SUBSCRIBE_DOMAIN="$SUBSCRIBE_DOMAIN"
 SUBSCRIBE_PATH="$SUBSCRIBE_PATH"
 SSH_PORT="$NEW_SSH_PORT"
 PUB_IP="$PUB_IP"
 EOF
 chmod 600 "$CONFIG_FILE"
+
+# === ПРОВЕРКА БЛОКА RKN ДЛЯ НОВОГО IP ===
+check_ip_blacklist "$PUB_IP"
 
 PANEL_URL="https://${PUB_IP}:${XUI_PORT}/$(echo "$XUI_PATH" | tr -d '"/')/"
 
@@ -151,6 +128,9 @@ cat <<EOF
   Password:   ${XUI_PASS}
   Port:       ${XUI_PORT}
 
+  В панели создай VLESS+Reality inbound на порту 443
+  (dest: www.cloudflare.com:443, fingerprint: chrome).
+
 [ Файл подписки ]
   URL:        http://${SUBSCRIBE_DOMAIN}${SUBSCRIBE_PATH}
               (через Cloudflare proxy: https://${SUBSCRIBE_DOMAIN}${SUBSCRIBE_PATH})
@@ -158,18 +138,18 @@ cat <<EOF
               ← положи сюда свои vless://... вручную
 
   CLOUDFLARE: проверь что в DNS A-запись ${SUBSCRIBE_DOMAIN} → ${PUB_IP}
-              и SSL/TLS Mode выставлен в "Flexible" (или "Full" с self-signed).
-
-[ MTProto каскад ]
-  Клиентский endpoint:  ${PUB_IP}:${RF_MTPROTO_PORT}
-  Перенаправление на:   ${SWISS_IP}:${SWISS_TELEMT_PORT}
-  Секрет:               возьми с швейцарского сервера (cat /etc/telemt/telemt.toml)
-  Готовая ссылка:       tg://proxy?server=${PUB_IP}&port=${RF_MTPROTO_PORT}&secret=<SWISS_SECRET>
+              proxy mode = ON (orange cloud)
+              SSL/TLS Mode = Flexible (или Full с self-signed)
 
 [ Безопасность ]
   SSH port:   ${NEW_SSH_PORT}    (ssh root@${PUB_IP} -p ${NEW_SSH_PORT})
   fail2ban:   3 попытки → бан 1 год
-  UFW:        включён, порты: ${NEW_SSH_PORT}, ${XUI_PORT}, 443, 8443, 80, ${RF_MTPROTO_PORT}
+  UFW:        включён, порты: ${NEW_SSH_PORT}, ${XUI_PORT}, 443, 8443, 80, 2096
+
+[ Мониторинг ]
+  vnstat -h            ← bandwidth по часам
+  sar -n DEV 1 10      ← live network metrics
+  Через 24ч появятся полные данные.
 
 ═══════════════════════════════════════════════════════════
   СОХРАНИ ЭТО! Конфиг записан в ${CONFIG_FILE}
