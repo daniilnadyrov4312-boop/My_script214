@@ -10,9 +10,12 @@ C_CYN='\033[0;36m'
 C_BLD='\033[1m'
 C_NC='\033[0m'
 
-log()    { echo -e "${C_CYN}[*]${C_NC} $*"; }
-ok()     { echo -e "${C_GRN}[OK]${C_NC} $*"; }
-warn()   { echo -e "${C_YLW}[!]${C_NC} $*"; }
+# ВСЕ диагностические сообщения идут в stderr — чтобы видеть их на терминале
+# даже когда функция вызывается через $(...), и при этом не загаживать
+# captured stdout (важно для функций типа randomize_ssh_port).
+log()    { echo -e "${C_CYN}[*]${C_NC} $*" >&2; }
+ok()     { echo -e "${C_GRN}[OK]${C_NC} $*" >&2; }
+warn()   { echo -e "${C_YLW}[!]${C_NC} $*" >&2; }
 die()    { echo -e "${C_RED}[ERR]${C_NC} $*" >&2; exit 1; }
 
 # --- ПРОВЕРКА ROOT ---
@@ -122,13 +125,24 @@ install_monitoring() {
     ok "vnstat + sysstat подняты (через 24ч будут полные графики)."
 }
 
-# --- СЛУЧАЙНЫЙ SSH-ПОРТ ---
+# --- СЛУЧАЙНЫЙ SSH-ПОРТ (идемпотентно) ---
+# Если порт уже установлен через наш custom_port.conf — переиспользуем,
+# чтобы повторный запуск скрипта не менял порт каждый раз.
 randomize_ssh_port() {
     local new_port
+    local cfg=/etc/ssh/sshd_config.d/custom_port.conf
+    if [ -f "$cfg" ]; then
+        new_port=$(grep -oP '^Port \K[0-9]+' "$cfg" | head -1)
+        if [ -n "$new_port" ]; then
+            warn "SSH-порт уже установлен на $new_port — переиспользую."
+            echo "$new_port"
+            return 0
+        fi
+    fi
     new_port=$(shuf -i 10000-65000 -n 1)
     log "Смена SSH-порта на $new_port..."
     mkdir -p /etc/ssh/sshd_config.d
-    echo "Port $new_port" >/etc/ssh/sshd_config.d/custom_port.conf
+    echo "Port $new_port" >"$cfg"
     sed -i 's/^Port [0-9]*/#&/g' /etc/ssh/sshd_config
     systemctl restart ssh 2>/dev/null || systemctl restart sshd
     ok "SSH теперь на порту $new_port (текущая сессия не разорвётся)."
