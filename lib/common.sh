@@ -186,67 +186,24 @@ extract_3xui_creds() {
     echo "$u $p $port $path"
 }
 
-# --- УСТАНОВКА 3X-UI ЧЕРЕЗ EXPECT ---
-# Поток актуального install.sh (mhsanaei/3x-ui, конец 2025):
-#   1. Авто-детект публичного IP. Если не вышло — спросит вручную.
-#   2. "Would you like to customize the Panel Port settings? [y/n]" → n (рандомный)
-#   3. SSL Setup (MANDATORY): "Choose an option (default 2 for IP)" → \r (= 2, LE для IP)
-#   4. "Port to use for ACME HTTP-01 listener (default 80)" → \r
-# ACME требует свободный 80/tcp снаружи; на свежей машине он свободный.
+# --- УСТАНОВКА 3X-UI ---
+# Установщик 3X-UI v3.2.x — полностью неинтерактивный:
+#   - SQLite по умолчанию
+#   - Авто-генерация порта/логина/пароля/web-пути
+#   - SSL: пробует LE для IP (если порт 80 закрыт — fallback на self-signed)
+# Никакого expect не нужно, просто пайпим установщик в bash с закрытым stdin.
 install_3xui() {
-    [ -f /usr/local/x-ui/x-ui ] && { warn "3X-UI уже установлен — пропускаю."; return; }
-    log "Установка 3X-UI..."
-    local pub_ip
-    pub_ip=$(detect_public_ip || true)
-    log "Public IP для fallback в установщик: ${pub_ip:-<not detected>}"
-    local logf=/tmp/3xui_install.log
-    PUB_IP_FOR_EXPECT="$pub_ip" expect <<'EXP' | tee "$logf"
-set timeout 600
-set pub_ip $env(PUB_IP_FOR_EXPECT)
-
-spawn bash -c "curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh | bash"
-
-# Глобальные обработчики (могут сработать в любой момент):
-expect_before {
-    "Please enter your server's public IPv4 address:" {
-        send "$pub_ip\r"; exp_continue
-    }
-    -re "Enter another port for acme.sh standalone listener.*:" {
-        send "\r"; exp_continue
-    }
-}
-
-expect "customize the Panel Port settings"
-sleep 1
-send "n\r"
-
-# SSL setup — выбираем дефолт (опция 2 = LE для IP)
-expect "Choose an option"
-sleep 1
-send "\r"
-
-# ACME HTTP-01 порт — дефолт 80
-expect "Port to use for ACME HTTP-01 listener"
-sleep 1
-send "\r"
-
-# Дальше после ACME могут быть пост-промпты (если LE-cert получен):
-#   - "Would you like to modify --reloadcmd for ACME?" → n (оставить дефолт)
-#   - "Would you like to set this certificate for the panel?" → y (применить сертификат)
-# Если LE упал — этих промптов не будет, идём прямо в eof.
-expect {
-    -re "modify --reloadcmd for ACME.*y/n" {
-        send "n\r"; exp_continue
-    }
-    -re "set this certificate for the panel.*y/n" {
-        send "y\r"; exp_continue
-    }
-    eof
-}
-EXP
+    if [ -f /usr/local/x-ui/x-ui ]; then
+        warn "3X-UI уже установлен — пропускаю установку, кредами берём из существующей БД."
+        return 0
+    fi
+    log "Установка 3X-UI (v3.2.x, auto-default)..."
+    if ! curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh | bash </dev/null; then
+        warn "Установщик 3X-UI вернул ненулевой exit-code — проверь вывод выше."
+    fi
     sleep 2
     if [ ! -f /usr/local/x-ui/x-ui ]; then
-        die "3X-UI install не отработал — смотри $logf"
+        die "3X-UI install не отработал — бинарь /usr/local/x-ui/x-ui не появился."
     fi
     ok "3X-UI установлен."
 }

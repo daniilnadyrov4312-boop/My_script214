@@ -28,7 +28,8 @@ SUBSCRIBE_PATH="${SUBSCRIBE_PATH:-/sub.txt}"
 [ -z "$SUBSCRIBE_DOMAIN" ] && die "Не задан SUBSCRIBE_DOMAIN. Запусти: SUBSCRIBE_DOMAIN=sub.example.com ./setup-rf.sh"
 
 if [ -f /usr/local/x-ui/x-ui ]; then
-    die "3X-UI уже установлен — скрипт только для чистой установки."
+    warn "3X-UI уже установлен — продолжаю с остальными шагами (nginx, ssh, ufw, monitoring)."
+    warn "  Чтобы переустановить 3X-UI с нуля: x-ui uninstall && ./setup-rf.sh"
 fi
 
 # === БАЗА ===
