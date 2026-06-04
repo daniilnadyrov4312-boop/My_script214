@@ -38,15 +38,13 @@ install_base_packages() {
     # Ubuntu 22+: needrestart показывает TUI-меню при установке пакетов — глушим
     export NEEDRESTART_MODE=a
     export NEEDRESTART_SUSPEND=1
-    # iptables-persistent на первой установке спрашивает "save current rules?" — отвечаем "yes" заранее
-    echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
-    echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
-
     apt-get update -y
+    # NB: iptables-persistent / netfilter-persistent на Ubuntu 24.04 (Noble) КОНФЛИКТУЮТ с ufw
+    # (ufw 0.36.2-6 объявляет Breaks: iptables-persistent). Раньше нужны были для kaskad-каскада,
+    # сейчас kaskad ставится отдельно через gokaskad и сам управляет своими правилами.
     apt-get install -y curl wget gnupg lsb-release ca-certificates \
         sqlite3 expect qrencode jq tar gzip \
-        ufw fail2ban unattended-upgrades \
-        netfilter-persistent iptables-persistent
+        ufw fail2ban unattended-upgrades
 }
 
 # --- TCP BBR ---
